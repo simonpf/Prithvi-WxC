@@ -1,5 +1,6 @@
 from functools import cached_property
 from importlib.metadata import version
+from typing import Callable, Optional, Tuple, Union
 
 from torch import Tensor
 from torch.utils.checkpoint import checkpoint
@@ -10,6 +11,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+from .modules import ObservationEncoder, MultiheadCrossAttention
 
 
 # DropPath code is straight from timm
@@ -119,11 +123,12 @@ class LayerNormPassThrough(nn.LayerNorm):
             output (Tensor): normalised output data
             attn_mask (Tensor): the attention mask that was passed in
         """
-        input, attn_mask = d
+        input, *other = d
         output = F.layer_norm(
             input, self.normalized_shape, self.weight, self.bias, self.eps
         )
-        return output, attn_mask
+        return (output,) + tuple(other)
+
 
 
 class MultiheadAttention(nn.Module):
@@ -223,6 +228,8 @@ class Transformer(nn.Module):
         n_heads: int,
         dropout: float,
         drop_path: float,
+        obs_features: Optional[int] = None,
+        obs_patch_size: Tuple[int, int] = (6, 4)
     ) -> None:
         """
         Args:
@@ -247,6 +254,15 @@ class Transformer(nn.Module):
             MultiheadAttention(features, n_heads, dropout),
         )
 
+        if obs_features is not None:
+            self.x_attention = nn.Sequential(
+                LayerNormPassThrough(features),
+                MultiheadCrossAttention(features, obs_features, n_heads, dropout=dropout)
+            )
+            self.gamma_obs = nn.Parameter(torch.tensor(1e-2))
+        else:
+            self.x_attention = None
+
         self.ff = nn.Sequential(
             nn.LayerNorm(features),
             Mlp(
@@ -256,7 +272,12 @@ class Transformer(nn.Module):
             ),
         )
 
-    def forward(self, d: tuple[Tensor, Tensor | None]) -> Tensor:
+    def forward(
+            self,
+            d: tuple[Tensor, Tensor | None],
+            obs: Optional[torch.Tensor] = None,
+            obs_mask: Optional[torch.Tensor] = None
+    ) -> Tensor:
         """
         Args:
             x: Tensor of shape [..., sequence, features]
@@ -272,6 +293,10 @@ class Transformer(nn.Module):
         attention_x = self.attention(d)
 
         x = x + self.drop_path(attention_x)
+
+        if self.x_attention is not None:
+            x = x + self.drop_path((self.gamma_obs * self.x_attention((x, obs, obs_mask))))
+
         x = x + self.drop_path(self.ff(x))
 
         return x
@@ -497,6 +522,8 @@ class LocalGlobalLocalBlock(nn.Module):
         drop_path: float,
         shifter: nn.Module | None = None,
         checkpoint: list[int] | None = None,
+        obs_features: Optional[int] = None,
+        obs_patch_size: Optional[Tuple[int, int]] = (6, 4)
     ) -> None:
         """
         Args:
@@ -532,15 +559,17 @@ class LocalGlobalLocalBlock(nn.Module):
                     n_heads=n_heads,
                     dropout=dropout,
                     drop_path=drop_path,
+                    obs_features= obs_features if (ind % 2) == 0 else None,
+                    obs_patch_size=obs_patch_size
                 )
-                for _ in range(2 * n_blocks + 1)
+                for ind in range(2 * n_blocks + 1)
             ]
         )
 
         self.evaluator = [
             self._checkpoint_wrapper
             if i in self._checkpoint
-            else lambda m, x: m(x)
+            else lambda m, x, **kwargs: m(x, **kwargs)
             for i, _ in enumerate(self.transformers)
         ]
 
@@ -552,7 +581,12 @@ class LocalGlobalLocalBlock(nn.Module):
     ) -> Tensor:
         return checkpoint(model, data, use_reentrant=False)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(
+            self,
+            x: Tensor,
+            obs: Optional[Tensor] = None,
+            obs_mask: Optional[Tensor] = None
+    ) -> Tensor:
         """
         Args:
             x: Tensor of shape::
@@ -581,7 +615,11 @@ class LocalGlobalLocalBlock(nn.Module):
 
         # First local block
         evaluator, transformer = next(transformer_iter)
-        x = evaluator(transformer, (x, attn_mask[local]))
+
+        if obs is not None:
+            x = evaluator(transformer, (x, attn_mask[local]), obs=obs, obs_mask=obs_mask)
+        else:
+            x = evaluator(transformer, (x, attn_mask[local]))
 
         for evaluator, transformer in transformer_iter:
             local = not local
@@ -589,7 +627,10 @@ class LocalGlobalLocalBlock(nn.Module):
             # So the output has the same shape as input.
             x = x.transpose(1, 2)
 
-            x = evaluator(transformer, (x, attn_mask[local]))
+            if local and obs is not None:
+                x = evaluator(transformer, (x, attn_mask[local]), obs=obs, obs_mask=obs_mask)
+            else:
+                x = evaluator(transformer, (x, attn_mask[local]))
 
             if not local:
                 x, attn_mask = self.shifter(x)
@@ -646,6 +687,8 @@ class PatchEmbed(nn.Module):
         return x
 
 
+
+
 class PrithviWxCEncoderDecoder(nn.Module):
     """
     Hiera-MaxViT encoder/decoder code.
@@ -661,6 +704,8 @@ class PrithviWxCEncoderDecoder(nn.Module):
         drop_path: float,
         shifter: nn.Module | None = None,
         transformer_cp: list[int] | None = None,
+        obs_features: Optional[int] = None,
+        obs_patch_size: Tuple[int, int] = (6, 4)
     ) -> None:
         """
         Args:
@@ -690,9 +735,16 @@ class PrithviWxCEncoderDecoder(nn.Module):
             n_blocks=n_blocks,
             shifter=shifter,
             checkpoint=transformer_cp,
+            obs_features=obs_features,
+            obs_patch_size=obs_patch_size
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+            self,
+            x: torch.Tensor,
+            obs: Optional[torch.Tensor] = None,
+            obs_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         """
         Args:
             x: Tensor of shape
@@ -702,8 +754,7 @@ class PrithviWxCEncoderDecoder(nn.Module):
                 [batch, mask_unit_sequence, local_sequence, embed_dim].
                 Identical in shape to the input x.
         """
-
-        x = self.lgl_block(x)
+        x = self.lgl_block(x, obs=obs, obs_mask=obs_mask)
 
         return x
 
@@ -745,6 +796,8 @@ class PrithviWxC(nn.Module):
         masking_mode: str,
         positional_encoding: str,
         decoder_shifting: bool = False,
+        obs_patch_size: Optional[Tuple[int]] = None,
+        obs_features: Optional[int] = None,
         checkpoint_encoder: list[int] | None = None,
         checkpoint_decoder: list[int] | None = None,
     ) -> None:
@@ -790,6 +843,8 @@ class PrithviWxC(nn.Module):
                 'fourier' lat/lon to be encoded using various frequencies
             masking_mode: String ['local', 'global', 'both'] that controls the
                 type of masking used.
+            obs_patch_size: If given, specifies the patch size with which observations
+                will be integrated into the model.
             checkpoint_encoder: List of integers controlling if gradient
               checkpointing is used on encoder.
                 Format: [] for no gradient checkpointing. [3, 7] for
@@ -823,6 +878,16 @@ class PrithviWxC(nn.Module):
         self.positional_encoding = positional_encoding
         self._checkpoint_encoder = checkpoint_encoder
         self._checkpoint_decoder = checkpoint_decoder
+
+        if obs_features is not None:
+            channels = (16, 32, obs_features)
+            self.obs_encoder = ObservationEncoder(
+                n_meta_features=8,
+                obs_patch_size=obs_patch_size,
+                channels=channels
+            )
+        else:
+            self.obs_encoder = None
 
         assert self.n_lats_px % self.mask_unit_size_px[0] == 0
         assert self.n_lons_px % self.mask_unit_size_px[1] == 0
@@ -915,6 +980,8 @@ class PrithviWxC(nn.Module):
             dropout=dropout,
             drop_path=drop_path,
             transformer_cp=checkpoint_encoder,
+            obs_patch_size=obs_patch_size,
+            obs_features=obs_features,
         )
 
         if n_blocks_decoder != 0:
@@ -990,7 +1057,8 @@ class PrithviWxC(nn.Module):
 
         maskable_indices = self._local_idx.view(1, -1).expand(*sizes[:2], -1)
 
-        maskable_indices = self._shuffle_along_axis(maskable_indices, 2)
+        if self.n_masked_local > 0:
+            maskable_indices = self._shuffle_along_axis(maskable_indices, 2)
 
         indices_masked = maskable_indices[:, :, : self.n_masked_local]
         indices_unmasked = maskable_indices[:, :, self.n_masked_local :]
@@ -1009,7 +1077,8 @@ class PrithviWxC(nn.Module):
 
         maskable_indices = self._global_idx.view(1, -1).expand(*sizes[:1], -1)
 
-        maskable_indices = self._shuffle_along_axis(maskable_indices, 1)
+        if self.n_masked_local > 0:
+            maskable_indices = self._shuffle_along_axis(maskable_indices, 1)
 
         indices_masked = maskable_indices[:, : self.n_masked_global]
         indices_unmasked = maskable_indices[:, self.n_masked_global :]
@@ -1178,7 +1247,7 @@ class PrithviWxC(nn.Module):
         s = x.shape
         return x.view(n_batch, -1, s[2] * s[3], s[4] * s[5])
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, batch: dict[str, torch.Tensor], apply_residual: bool = True) -> torch.Tensor:
         """
         Args:
             batch: Dictionary the following keys::
@@ -1254,7 +1323,7 @@ class PrithviWxC(nn.Module):
             batch["input_time"], batch["lead_time"]
         )
 
-        tokens = x_embedded + static_embedded + time_encoding
+        tokens = static_embedded + time_encoding #x_embedded + static_embedded + time_encoding
 
         # Now we generate masks based on masking_mode
         indices_masked, indices_unmasked = self.generate_mask(
@@ -1263,6 +1332,7 @@ class PrithviWxC(nn.Module):
         indices_masked = indices_masked.to(device=tokens.device)
         indices_unmasked = indices_unmasked.to(device=tokens.device)
         maskdim: int = indices_masked.ndim
+
 
         # Unmasking
         unmask_view = (*indices_unmasked.shape, *[1] * (tokens.ndim - maskdim))
@@ -1274,8 +1344,42 @@ class PrithviWxC(nn.Module):
             ),
         )
 
+        # Observations
+        if self.obs_encoder is not None:
+            obs = batch["obs"]
+            mask = batch["obs_mask"]
+            meta = batch["obs_meta"]
+            pos = x_static_pos
+            obs_enc, obs_mask_enc, meta_enc, pos_enc = self.obs_encoder(obs, mask, meta, pos)
+
+            # obs_enc: [B x T x GY x GX x O x C x LY x LX]
+            obs_enc = obs_enc# + meta_enc + pos_enc
+
+            # Move spatial dims to front: [B x T x GY x GX x O x C x LY x LX] -> [B x GY x GX x LY x LX x T x O x C]
+            obs_enc = torch.permute(obs_enc, (0, 2, 3, 6, 7, 1, 4, 5)).contiguous()
+            # Fold time and obs layers into one dim -> [B x GY x GX x LY x LX x TO x C]
+            obs_enc = torch.flatten(obs_enc, 5, 6)
+            # Fold global and local dims;  [B, GL, TO, C]
+            obs_enc = torch.flatten(obs_enc, 1, 4)
+
+            #assert obs_enc.shape[-2] == 64
+            assert obs_enc.shape[-1] == self.obs_encoder.channels[-1]
+            assert obs_enc.shape[1] == 12 * 18 * 30 * 32 // (self.obs_encoder.patch_height * self.obs_encoder.patch_width)
+
+            # Fold obs layers and time: [B x TO X GY x GX x LY x LX]
+            obs_mask_enc = torch.permute(obs_mask_enc, (0, 2, 3, 5, 6, 1, 4)).contiguous()
+            obs_mask_enc = obs_mask_enc.flatten(5, 6)
+            # Final shape: [B x GL x TO]
+            obs_mask_enc = obs_mask_enc.flatten(1, 4)
+            assert obs_enc.shape[:-1] == obs_mask_enc.shape
+        else:
+            obs_enc = None
+            obs_mask_enc = None
+
         # Encoder
-        x_encoded = self.encoder(unmasked)
+        #return unmasked, obs_enc, obs_mask_enc
+
+        x_encoded = self.encoder(unmasked, obs=obs_enc, obs_mask=obs_mask_enc)
 
         # Generate and position encode the mask tokens
         # [1, 1, 1, embed_dim]
@@ -1291,10 +1395,11 @@ class PrithviWxC(nn.Module):
             ),
         )
 
+
         recon, _ = self.reconstruct_batch(
             indices_masked, indices_unmasked, masked, x_encoded
         )
-
+        diff = recon - x_encoded
         x_decoded = self.decoder(recon)
 
         # Output: [batch, global sequence, local sequence,
@@ -1308,12 +1413,15 @@ class PrithviWxC(nn.Module):
         # Pixel shuffle to [batch, in_channels, lat, lon]
         x_out = F.pixel_shuffle(x_out, self.patch_size_px[0])
 
+        if not apply_residual:
+            return x_out
+
         if self.residual == "temporal":
             x_out = self.output_scalers * x_out + x_hat
         elif self.residual == "climate":
             x_out = self.output_scalers * x_out + batch["climate"]
         elif self.residual == "none":
-            x_out = (
+           x_out = (
                 self.output_scalers * x_out
                 + self.input_scalers_mu.reshape(1, -1, 1, 1)
             )
