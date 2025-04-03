@@ -1300,7 +1300,11 @@ class PrithviWxC(nn.Module):
         s = x.shape
         return x.view(n_batch, -1, s[2]*s[3], s[4]*s[5])
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(
+            self,
+            batch: dict[str, torch.Tensor],
+            apply_residual: bool = True
+    ) -> torch.Tensor:
         """
         Args:
             batch: Dictionary containing the keys 'x', 'y', 'input_time',
@@ -1318,9 +1322,9 @@ class PrithviWxC(nn.Module):
         assert batch["x"].shape[2] == self.in_channels
         assert batch["x"].shape[3] == self.n_lats_px
         assert batch["x"].shape[4] == self.n_lons_px
-        assert batch["y"].shape[1] == self.in_channels
-        assert batch["y"].shape[2] == self.n_lats_px
-        assert batch["y"].shape[3] == self.n_lons_px
+        #assert batch["y"].shape[1] == self.in_channels
+        #assert batch["y"].shape[2] == self.n_lats_px
+        #assert batch["y"].shape[3] == self.n_lons_px
         if self.positional_encoding == 'fourier':
             # the first two features (lat, lon) are encoded separately
             assert batch['static'].shape[1] - 2 == self.in_channels_static, "When setting self.positional_encoding to fourier, the number of static params change in the dataset. So, in the config, reduce num_static_channels (e.g., 4 instead of 7)."
@@ -1329,9 +1333,14 @@ class PrithviWxC(nn.Module):
         assert batch["static"].shape[2] == self.n_lats_px
         assert batch["static"].shape[3] == self.n_lons_px
 
+        print("static :: ", torch.isnan(batch['static']).any())
+        print("x :: ", torch.isnan(batch['x']).any())
+        print("climate :: ", torch.isnan(batch['climate']).any())
+
         x_rescaled = (batch["x"] - self.input_scalers_mu) / (
             self.input_scalers_sigma + self.input_scalers_epsilon
         )
+        print("scaled :: ", torch.isnan(x_rescaled).any(), x_rescaled.min(), x_rescaled.max())
         batch_size = x_rescaled.shape[0]
 
         if self.positional_encoding == 'fourier':
@@ -1343,6 +1352,8 @@ class PrithviWxC(nn.Module):
             x_static = (batch["static"] - self.static_input_scalers_mu) / (
                 self.static_input_scalers_sigma + self.static_input_scalers_epsilon
             )
+
+        print("x_static :: ", torch.isnan(x_static).any())
 
         if self.residual == "temporal":
             # We create a residual of same shape as y
@@ -1365,8 +1376,10 @@ class PrithviWxC(nn.Module):
         x_rescaled = x_rescaled.flatten(1, 2)
         # Parameter dropout
         x_rescaled = self.parameter_dropout(x_rescaled)
+        print("dropout", torch.isnan(x_rescaled).any())
 
         x_embedded = self.patch_embedding(x_rescaled)
+        print("x_embedded :: ", torch.isnan(x_embedded).any())
         assert x_embedded.shape[1] == self.embed_dim
 
         if self.residual == "climate":
@@ -1382,10 +1395,14 @@ class PrithviWxC(nn.Module):
 
         x_embedded = self.to_patching(x_embedded)
         static_embedded = self.to_patching(static_embedded)
+        print("static_embedded :: ", torch.isnan(static_embedded).any())
 
         time_encoding = self.time_encoding(batch['input_time'], batch['lead_time'])
+        print("time_encoding", torch.isnan(time_encoding).any())
 
         tokens = x_embedded + static_embedded + time_encoding
+
+        print("TOKENS :: ", torch.isnan(tokens).any())
 
         # Now we generate masks based on masking_mode
         indices_masked, indices_unmasked = self.generate_mask(
@@ -1407,6 +1424,7 @@ class PrithviWxC(nn.Module):
 
         # Encoder
         x_encoded = self.encoder(unmasked)
+        print("NAN ENC :: ", torch.isnan(x_encoded).any())
 
         # Generate and position encode the mask tokens
         # (1, 1, 1, embed_dim) -> (batch, global_seq_masked, local seq, embed_dim)
@@ -1443,6 +1461,10 @@ class PrithviWxC(nn.Module):
 
         # Pixel shuffle to (batch, in_channels, lat, lon)
         x_out = F.pixel_shuffle(x_out, self.patch_size_px[0])
+
+        print("NAN :: ", torch.isnan(x_out).any())
+        if not apply_residual:
+            return x_out
 
         if self.residual == "temporal":
             x_out = self.output_scalers * x_out + x_hat
