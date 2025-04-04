@@ -1333,9 +1333,10 @@ class PrithviWxC(nn.Module):
         assert batch["static"].shape[2] == self.n_lats_px
         assert batch["static"].shape[3] == self.n_lons_px
 
-        x_rescaled = (batch["x"] - self.input_scalers_mu) / (
+        dtype = batch["x"].dtype
+        x_rescaled = (batch["x"].to(dtype=torch.float32) - self.input_scalers_mu) / (
             self.input_scalers_sigma + self.input_scalers_epsilon
-        )
+        ).to(dtype=dtype)
         batch_size = x_rescaled.shape[0]
 
         if self.positional_encoding == 'fourier':
