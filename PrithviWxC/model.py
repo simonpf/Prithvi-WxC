@@ -1337,17 +1337,19 @@ class PrithviWxC(nn.Module):
         x_rescaled = (batch["x"].to(dtype=torch.float32) - self.input_scalers_mu) / (
             self.input_scalers_sigma + self.input_scalers_epsilon
         ).to(dtype=dtype)
+        x_rescaled = torch.clip(x_rescaled, -10.0, 10)
         batch_size = x_rescaled.shape[0]
 
         if self.positional_encoding == 'fourier':
             x_static_pos = self.fourier_pos_encoding(batch['static']) # B, embed_dim, lat / patch_size, lon / patch_size
-            x_static = (batch['static'][:, 2:] - self.static_input_scalers_mu[:, 3:]) / ( # The first two channels in batch['static'] are used in positional encoding
+            x_static = (batch['static'][:, 2:].to(dtype=torch.float32) - self.static_input_scalers_mu[:, 3:]) / ( # The first two channels in batch['static'] are used in positional encoding
                 self.static_input_scalers_sigma[:, 3:] + self.static_input_scalers_epsilon # This translates to the first three channels in 'static_input_scalers_mu'
-            )
+            ).to(dtype=dtype)
         else:
-            x_static = (batch["static"] - self.static_input_scalers_mu) / (
+            x_static = (batch["static"].to(dtype=torch.float32) - self.static_input_scalers_mu) / (
                 self.static_input_scalers_sigma + self.static_input_scalers_epsilon
-            )
+            ).to(dtype=dtype)
+        x_static = torch.clip(x_static, -10.0, 10)
 
         if self.residual == "temporal":
             # We create a residual of same shape as y
@@ -1361,10 +1363,11 @@ class PrithviWxC(nn.Module):
             ), f'Shapes {batch["y"].shape} and {x_hat.shape} do not agree.'
         elif self.residual == "climate":
             climate_scaled = (
-                batch["climate"] - self.input_scalers_mu.view(1, -1, 1, 1)
+                batch["climate"].to(dtype=torch.float32) - self.input_scalers_mu.view(1, -1, 1, 1)
             ) / (
                 self.input_scalers_sigma.view(1, -1, 1, 1) + self.input_scalers_epsilon
-            )
+            ).to(dtype=dtype)
+            climate_scaled = torch.clip(climate_scaled, -10.0, 10)
 
         # [batch, time, parameter, lat, lon] -> [batch, time x parameter, lat, lon]
         x_rescaled = x_rescaled.flatten(1, 2)
