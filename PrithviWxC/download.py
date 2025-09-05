@@ -11,7 +11,9 @@ import getpass
 import logging
 import os
 from pathlib import Path
+import random
 import re
+import time
 from typing import List, Optional, Tuple, Union
 
 import requests
@@ -196,14 +198,29 @@ def download_merra_file(
         auth = credentials
 
     with requests.Session() as session:
+        session.headers["User-Agent"] = "python-requests/edl"
         session.auth = auth
-        redirect = session.get(url, auth=auth)
-        response = session.get(redirect.url, auth=auth, stream=True)
-        response.raise_for_status()
 
-        with open(destination, "wb") as output:
-            for chunk in response:
-                output.write(chunk)
+        retry = 0
+        while retry < 3:
+            try:
+                redirect = session.get(url, allow_redirects=True)
+                final_url = redirect.url
+                response = session.get(final_url, stream=True)
+                response.raise_for_status()
+
+                with open(destination, "wb") as output:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        output.write(chunk)
+                break
+            except requests.exceptions.HTTPError as exc:
+                retry += 1
+                if 2 < retry:
+                    raise exc
+                time.sleep(1.0 + 2 ** retry)
+
+        if 0 < retry:
+            raise exc
 
     return destination
 
@@ -255,12 +272,16 @@ def download_merra_files(
         tasks[pool.submit(download_merra_file, merra_const_url, destination, credentials=auth)] = merra_const_url
 
         files = []
-        for task in tqdm(as_completed(tasks), total=len(tasks), desc="Downloading MERRA-2 files."):
+        pbar = tqdm(total=len(tasks))
+        pbar.set_description("Downloading MERRA-2 files.")
+        for task in as_completed(tasks):
             try:
                 files.append(task.result())
             except Exception as exc:
                 raise exc
-
+            finally:
+                pbar.update()
+        pbar.close()
     return files
 
 
@@ -543,7 +564,7 @@ def get_prithvi_wxc_input(
     LOGGER.info("Downloading climatology files.")
     get_prithvi_wxc_climatology(
         input_times + list(output_times),
-        input_data_dir / "../climatology"
+        input_data_dir.parent
     )
 
 
