@@ -280,7 +280,7 @@ def download_merra_files(
             except Exception as exc:
                 raise exc
             finally:
-                pbar.update()
+                pbar.update(1)
         pbar.close()
     return files
 
